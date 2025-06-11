@@ -37,6 +37,7 @@
 #include "srsran/phy/phch/pssch.h"
 #include "srsran/phy/rf/rf.h"
 #include "srsran/srsran.h"
+#include "srsran/phy/utils/debug.h"
 
 // 全局变量
 volatile bool go_exit = false;
@@ -214,15 +215,32 @@ int main(int argc, char** argv)
   signal(SIGINT, sig_int_handler);
   
   // 设置cell参数
-  cell.nof_prb = prog_args.nof_prb;
+  cell.tm = SRSRAN_SIDELINK_TM1;
+  cell.N_sl_id = 0;
+  cell.nof_prb = 50;
   cell.cp = SRSRAN_CP_NORM;
-  cell.sl_comm_resource_pool = &sl_comm_resource_pool;
   
-  // 设置PSCCH配置
-  pssch_cfg.N_x_id = prog_args.cell_id;  // 使用prog_args.cell_id替代cell.id
+  // 初始化资源池配置
+  sl_comm_resource_pool.period_length = 40;
+  sl_comm_resource_pool.prb_num = 50;
+  sl_comm_resource_pool.prb_start = 0;
+  sl_comm_resource_pool.prb_end = 49;
+  
+  // 初始化PSSCH配置
   pssch_cfg.prb_start_idx = 0;
-  pssch_cfg.prb_end_idx = cell.nof_prb - 1;
-  pssch_cfg.mcs_idx = prog_args.mcs;
+  pssch_cfg.nof_prb = cell.nof_prb;
+  
+  // 初始化PSSCH对象
+  if (srsran_pssch_init(&pssch, cell.nof_prb) != SRSRAN_SUCCESS) {
+    fprintf(stderr, "Error initializing PSSCH\n");
+    return -1;
+  }
+  
+  // 设置PSSCH配置
+  if (srsran_pssch_set_cell(&pssch, cell) != SRSRAN_SUCCESS) {
+    fprintf(stderr, "Error setting PSSCH cell\n");
+    return -1;
+  }
   
   // 打开RF设备
   if (srsran_rf_open_devname(&radio, prog_args.rf_dev, prog_args.rf_args, 1)) {  // 使用固定值1替代cell.nof_ports
@@ -237,18 +255,6 @@ int main(int argc, char** argv)
   // 初始化PSCCH
   if (srsran_pscch_init(&pscch, cell.nof_prb) != SRSRAN_SUCCESS) {
     ERROR("Error initializing PSCCH");
-    return -1;
-  }
-  
-  // 初始化PSSCH
-  if (srsran_pssch_init(&pssch, &cell, &sl_comm_resource_pool) != SRSRAN_SUCCESS) {
-    ERROR("Error initializing PSSCH");
-    return -1;
-  }
-  
-  // 设置PSSCH配置
-  if (srsran_pssch_set_cfg(&pssch, pssch_cfg) != SRSRAN_SUCCESS) {
-    ERROR("Error setting PSSCH config");
     return -1;
   }
   
