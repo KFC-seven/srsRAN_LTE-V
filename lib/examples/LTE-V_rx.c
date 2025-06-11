@@ -30,6 +30,8 @@
 #include <strings.h>
 #include <sys/time.h>
 #include <unistd.h>
+#include <stdarg.h>
+#include <libconfig.h>
 #include <matio.h>
 #include <sys/stat.h>
 
@@ -240,7 +242,7 @@ static void usage(char* prog)
   printf("  -f <频率>        覆盖配置文件中的rx_freq (Hz)\n");
   printf("  -g <增益>        覆盖配置文件中的rx_gain (dB)\n");
   printf("  -p <PRB数>       覆盖配置文件中的nof_prb\n");
-  printf("  -c <小区ID>      覆盖配置文件中的cell_id\n");
+  printf("  -C <小区ID>      覆盖配置文件中的cell_id\n");
   printf("  -r <RNTI>        覆盖配置文件中的rnti (十六进制)\n");
   printf("  -m <MCS>         覆盖配置文件中的mcs\n");
   printf("  -n <子帧数>      覆盖配置文件中的nof_subframes\n");
@@ -258,7 +260,7 @@ static void parse_args(prog_args_t* args, int argc, char** argv)
   int opt;
   const char* config_file = NULL;
   
-  while ((opt = getopt(argc, argv, "c:I:a:f:g:p:c:r:m:n:o:l:v")) != -1) {
+  while ((opt = getopt(argc, argv, "c:I:a:f:g:p:C:r:m:n:o:l:v")) != -1) {
     switch (opt) {
       case 'c':
         config_file = optarg;
@@ -278,7 +280,7 @@ static void parse_args(prog_args_t* args, int argc, char** argv)
       case 'p':
         args->nof_prb = atoi(optarg);
         break;
-      case 'c':
+      case 'C':
         args->cell_id = atoi(optarg);
         break;
       case 'r':
@@ -305,7 +307,6 @@ static void parse_args(prog_args_t* args, int argc, char** argv)
     }
   }
   
-  // 如果指定了配置文件，则读取配置文件
   if (config_file) {
     read_config_file(args, config_file);
   }
@@ -591,11 +592,13 @@ int main(int argc, char** argv)
   int nf = 0;
   while ((nf < prog_args.nof_subframes || prog_args.nof_subframes == -1) && !go_exit) {
     // 接收信号
-    srsran_rf_recv(&radio, sf_buffer, SRSRAN_SF_LEN_PRB(cell.nof_prb), true, false, false);
+    srsran_rf_recv(&radio, sf_buffer, SRSRAN_SF_LEN_PRB(cell.nof_prb), true);
     
     // 解码PSCCH获取RNTI
+    uint8_t sci[32];
     uint32_t detected_rnti = 0;
-    if (srsran_pscch_decode(&pscch, sf_buffer, &detected_rnti) == SRSRAN_SUCCESS) {
+    if (srsran_pscch_decode(&pscch, sf_buffer, sci, pssch_cfg.prb_start_idx) == SRSRAN_SUCCESS) {
+      detected_rnti = (sci[0] << 8) | sci[1];  // 从SCI中提取RNTI
       // 提取DMRS导频
       cf_t* dmrs_received = NULL;
       if (srsran_chest_sl_pssch_get_dmrs(&chest, sf_buffer, &dmrs_received) == SRSRAN_SUCCESS) {

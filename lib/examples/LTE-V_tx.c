@@ -30,6 +30,7 @@
 #include <strings.h>
 #include <sys/time.h>
 #include <unistd.h>
+#include <stdarg.h>
 
 #include "srsran/phy/common/phy_common.h"
 #include "srsran/phy/phch/pscch.h"
@@ -316,7 +317,7 @@ int main(int argc, char** argv)
     }
     
     // 发送信号
-    srsran_rf_send(&radio, sf_buffer, SRSRAN_SF_LEN_PRB(cell.nof_prb), true, false, false);
+    srsran_rf_send(&radio, sf_buffer, SRSRAN_SF_LEN_PRB(cell.nof_prb), true);
     
     // 记录发送信息
     log_message(prog_args.log_file, "子帧 %d: 成功发送LTE-V信号\n", nf);
