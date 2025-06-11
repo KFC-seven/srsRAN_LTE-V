@@ -24,6 +24,7 @@
 #include <string.h>
 #include <strings.h>
 #include <unistd.h>
+#include <signal.h>
 
 #include "srsran/phy/ch_estimation/chest_sl.h"
 #include "srsran/phy/common/phy_common_sl.h"
@@ -56,6 +57,20 @@ static char*            input_file_name = NULL;
 static srsran_filesource_t fsrc;
 static bool             use_standard_lte_rates = false;
 static uint32_t         file_offset            = 0;
+
+// 添加帧间隔相关变量
+static uint32_t sf_len = 0;
+static uint32_t sf_period = 0;
+static bool go_exit = false;
+
+// 信号处理函数
+static void sig_int_handler(int signo)
+{
+  printf("SIGINT received. Exiting...\n");
+  if (signo == SIGINT) {
+    go_exit = true;
+  }
+}
 
 void usage(char* prog)
 {
@@ -171,10 +186,17 @@ int main(int argc, char** argv)
 
   parse_args(argc, argv);
 
+  // 设置信号处理
+  signal(SIGINT, sig_int_handler);
+
   if (base_init() != SRSRAN_SUCCESS) {
     ERROR("Error in base initialization");
     goto clean_exit;
   }
+
+  // 计算子帧长度和周期
+  sf_len = srsran_symbol_sz(cell.nof_prb) * 15;  // 一个子帧的采样点数
+  sf_period = sf_len * 1000 / 30720;  // 1ms子帧周期(30.72MHz采样率)
 
   // Configure PSSCH
   srsran_pssch_cfg_t pssch_cfg = {
@@ -210,12 +232,6 @@ int main(int argc, char** argv)
     goto clean_exit;
   }
 
-  // Encode PSCCH
-  if (srsran_pscch_encode(&pscch, sci_msg, sf_buffer, prb_start_idx) != SRSRAN_SUCCESS) {
-    ERROR("Error encoding PSCCH");
-    goto clean_exit;
-  }
-
   // Generate random data for PSSCH
   uint8_t* data = srsran_vec_u8_malloc(pssch.sl_sch_tb_len);
   if (!data) {
@@ -223,29 +239,42 @@ int main(int argc, char** argv)
     goto clean_exit;
   }
 
-  for (int i = 0; i < pssch.sl_sch_tb_len; i++) {
-    data[i] = rand() % 256;
-  }
+  // 主循环
+  while (!go_exit) {
+    // 生成新的随机数据
+    for (int i = 0; i < pssch.sl_sch_tb_len; i++) {
+      data[i] = rand() % 256;
+    }
 
-  // Encode PSSCH
-  if (srsran_pssch_encode(&pssch, data, sf_buffer) != SRSRAN_SUCCESS) {
-    ERROR("Error encoding PSSCH");
-    goto clean_exit;
-  }
+    // Encode PSCCH
+    if (srsran_pscch_encode(&pscch, sci_msg, sf_buffer, prb_start_idx) != SRSRAN_SUCCESS) {
+      ERROR("Error encoding PSCCH");
+      goto clean_exit;
+    }
 
-  // Add DMRS
-  if (srsran_chest_sl_put_dmrs(&chest_sl, sf_buffer) != SRSRAN_SUCCESS) {
-    ERROR("Error adding DMRS");
-    goto clean_exit;
-  }
+    // Encode PSSCH
+    if (srsran_pssch_encode(&pssch, data, sf_buffer) != SRSRAN_SUCCESS) {
+      ERROR("Error encoding PSSCH");
+      goto clean_exit;
+    }
 
-  // Convert to time domain
-  srsran_ofdm_tx_sf(&fft);
+    // Add DMRS
+    if (srsran_chest_sl_put_dmrs(&chest_sl, sf_buffer) != SRSRAN_SUCCESS) {
+      ERROR("Error adding DMRS");
+      goto clean_exit;
+    }
 
-  // Transmit
-  if (srsran_radio_tx(&radio, sf_buffer, sf_n_samples, 0, 0, 0) != SRSRAN_SUCCESS) {
-    ERROR("Error transmitting");
-    goto clean_exit;
+    // Convert to time domain
+    srsran_ofdm_tx_sf(&fft);
+
+    // Transmit
+    if (srsran_radio_tx(&radio, sf_buffer, sf_n_samples, 0, 0, 0) != SRSRAN_SUCCESS) {
+      ERROR("Error transmitting");
+      goto clean_exit;
+    }
+
+    // 等待一个子帧周期
+    usleep(sf_period);
   }
 
   ret = SRSRAN_SUCCESS;
