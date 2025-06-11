@@ -26,6 +26,10 @@
 #include <unistd.h>
 #include <signal.h>
 #include <inttypes.h>
+#include <complex.h>
+#include <stdarg.h>
+#include <sys/stat.h>
+#include <errno.h>
 
 #include "srsran/phy/ch_estimation/chest_sl.h"
 #include "srsran/phy/common/phy_common_sl.h"
@@ -38,620 +42,261 @@
 #include "srsran/phy/utils/vector.h"
 #include "srsran/phy/rf/rf.h"
 
-// 全局变量
-volatile bool go_exit = false;
+#define MAX_SF_BUFFER_SIZE (15 * 2048)
 
-// DMRS矩阵结构体
-typedef struct {
-  uint32_t rnti;
-  cf_t* dmrs_matrix;
-  uint32_t num_frames;
-  uint32_t num_samples;
-  uint32_t capacity;
-} dmrs_matrix_t;
+static srsran_cell_sl_t cell = {.nof_prb = 6, .N_sl_id = 0, .tm = SRSRAN_SIDELINK_TM2, .cp = SRSRAN_CP_NORM};
+static srsran_sl_comm_resource_pool_t sl_comm_resource_pool = {
+    .period_length = 40,
+    .prb_num = 6,
+    .prb_start = 0,
+    .prb_end = 5
+};
 
-// 设备DMRS矩阵管理结构体
-typedef struct {
-  dmrs_matrix_t** matrices;  // 设备矩阵数组
-  uint32_t num_devices;      // 当前设备数量
-  uint32_t capacity;         // 当前容量
-} device_manager_t;
+static uint32_t        mcs_idx       = 4;
+static uint32_t        prb_start_idx = 0;
+static uint32_t        sf_n_samples  = 0;
+static uint32_t        sf_n_re       = 0;
+static cf_t*           sf_buffer     = NULL;
+static srsran_ofdm_t   fft;
+static srsran_rf_t     rf;
+static srsran_pssch_t  pssch;
+static srsran_pscch_t  pscch;
+static srsran_sci_t    sci;
+static srsran_chest_sl_t chest_sl;
 
-// 程序参数结构体
-typedef struct {
-  // RF设备配置
-  char* rf_dev;
-  char* rf_args;
-  float rf_freq;
-  float rf_gain;
-  uint32_t nof_rx_antennas;
+static char*            output_file_name = NULL;
+static srsran_filesink_t fsink;
+static bool             go_exit = false;
 
-  // LTE-V基本参数
-  uint32_t nof_prb;
-  uint32_t nof_ports;
-  uint32_t cell_id;
-  uint32_t rnti;
-  uint32_t mcs;
-  uint32_t rv;
-
-  // LTE-V高级参数
-  uint32_t size_sub_channel;
-  uint32_t num_sub_channel;
-  uint32_t tdd_config;
-  uint32_t tdd_special_sf;
-  bool enable_256qam;
-
-  // 高级配置
-  bool use_standard_lte_rates;
-  int nof_subframes;
-  
-  // 文件保存配置
-  char* output_dir;
-  char* log_file;
-  
-  // DMRS矩阵配置
-  uint32_t initial_matrix_capacity;
-  uint32_t initial_device_capacity;
-} prog_args_t;
-
-// 将free_dmrs_matrix函数声明移到前面
-static void free_dmrs_matrix(dmrs_matrix_t* matrix);
-
-// 默认参数设置
-static void args_default(prog_args_t* args)
+void usage(char* prog)
 {
-  args->rf_dev = "uhd";
-  args->rf_args = "";
-  args->rf_freq = 5900000000; // 5.9GHz for V2X
-  args->rf_gain = 20;
-  args->nof_rx_antennas = 1;
-
-  args->nof_prb = 25;
-  args->nof_ports = 1;
-  args->cell_id = 1;
-  args->rnti = 0x1234;
-  args->mcs = 10;
-  args->rv = 0;
-
-  args->size_sub_channel = 10;
-  args->num_sub_channel = 1;
-  args->tdd_config = 0;
-  args->tdd_special_sf = 0;
-  args->enable_256qam = false;
-
-  args->use_standard_lte_rates = false;
-  args->nof_subframes = -1;
-  
-  args->output_dir = "dmrs_data";
-  args->log_file = "ltev_rx.log";
-  args->initial_matrix_capacity = 1000;
-  args->initial_device_capacity = 10;
+  printf("Usage: %s [emptv]\n", prog);
+  printf("\t-p nof_prb [Default %d]\n", cell.nof_prb);
+  printf("\t-m mcs_idx [Default %d]\n", mcs_idx);
+  printf("\t-e extended CP [Default normal]\n");
+  printf("\t-t Sidelink transmission mode {1,2,3,4} [Default %d]\n", (cell.tm + 1));
+  printf("\t-v [set srsran_verbose to debug, default none]\n");
 }
 
-// 信号处理函数
-static void sig_int_handler(int signo)
-{
-  printf("SIGINT received. Exiting...\n");
-  if (signo == SIGINT) {
-    go_exit = true;
-  }
-}
-
-// 从配置文件读取参数
-static void read_config_file(prog_args_t* args, const char* filename)
-{
-  config_t config;
-  config_init(&config);
-  
-  if (config_read_file(&config, filename) == CONFIG_FALSE) {
-    fprintf(stderr, "Error reading config file: %s\n", config_error_text(&config));
-    config_destroy(&config);
-    return;
-  }
-  
-  // 读取RF配置
-  const char* device_name;
-  if (config_lookup_string(&config, "rf.device_name", &device_name)) {
-    args->rf_dev = strdup(device_name);
-  }
-  
-  const char* device_args;
-  if (config_lookup_string(&config, "rf.device_args", &device_args)) {
-    args->rf_args = strdup(device_args);
-  }
-  
-  double freq;
-  if (config_lookup_float(&config, "rf.rx_freq", &freq)) {
-    args->rf_freq = freq;
-  }
-  
-  double gain;
-  if (config_lookup_float(&config, "rf.rx_gain", &gain)) {
-    args->rf_gain = gain;
-  }
-  
-  int nof_rx_antennas;
-  if (config_lookup_int(&config, "rf.nof_rx_antennas", &nof_rx_antennas)) {
-    args->nof_rx_antennas = nof_rx_antennas;
-  }
-  
-  // 读取Sidelink配置
-  int nof_prb;
-  if (config_lookup_int(&config, "sidelink.nof_prb", &nof_prb)) {
-    args->nof_prb = nof_prb;
-  }
-  
-  int nof_ports;
-  if (config_lookup_int(&config, "sidelink.nof_ports", &nof_ports)) {
-    args->nof_ports = nof_ports;
-  }
-  
-  int cell_id;
-  if (config_lookup_int(&config, "sidelink.cell_id", &cell_id)) {
-    args->cell_id = cell_id;
-  }
-  
-  int rnti;
-  if (config_lookup_int(&config, "sidelink.rnti", &rnti)) {
-    args->rnti = rnti;
-  }
-  
-  int mcs;
-  if (config_lookup_int(&config, "sidelink.mcs", &mcs)) {
-    args->mcs = mcs;
-  }
-  
-  int rv;
-  if (config_lookup_int(&config, "sidelink.rv", &rv)) {
-    args->rv = rv;
-  }
-  
-  // 读取文件配置
-  const char* output_dir;
-  if (config_lookup_string(&config, "file.output_dir", &output_dir)) {
-    args->output_dir = strdup(output_dir);
-  }
-  
-  const char* log_file;
-  if (config_lookup_string(&config, "file.log_file", &log_file)) {
-    args->log_file = strdup(log_file);
-  }
-  
-  // 读取DMRS配置
-  int initial_matrix_capacity;
-  if (config_lookup_int(&config, "dmrs.initial_matrix_capacity", &initial_matrix_capacity)) {
-    args->initial_matrix_capacity = initial_matrix_capacity;
-  }
-  
-  int initial_device_capacity;
-  if (config_lookup_int(&config, "dmrs.initial_device_capacity", &initial_device_capacity)) {
-    args->initial_device_capacity = initial_device_capacity;
-  }
-  
-  config_destroy(&config);
-}
-
-// 修改usage函数，添加配置文件选项
-static void usage(char* prog)
-{
-  printf("Usage: %s [选项]\n", prog);
-  printf("选项:\n");
-  printf("  -c <配置文件>    指定配置文件路径\n");
-  printf("  -I <设备名称>    覆盖配置文件中的device_name\n");
-  printf("  -a <设备参数>    覆盖配置文件中的device_args\n");
-  printf("  -f <频率>        覆盖配置文件中的rx_freq (Hz)\n");
-  printf("  -g <增益>        覆盖配置文件中的rx_gain (dB)\n");
-  printf("  -p <PRB数>       覆盖配置文件中的nof_prb\n");
-  printf("  -C <小区ID>      覆盖配置文件中的cell_id\n");
-  printf("  -r <RNTI>        覆盖配置文件中的rnti (十六进制)\n");
-  printf("  -m <MCS>         覆盖配置文件中的mcs\n");
-  printf("  -n <子帧数>      覆盖配置文件中的nof_subframes\n");
-  printf("  -o <输出目录>    保存DMRS数据的目录\n");
-  printf("  -l <日志文件>    日志文件名\n");
-  printf("  -v               增加详细输出\n");
-  printf("\n示例:\n");
-  printf("  %s -c LTE-V_rx.conf\n", prog);
-  printf("  %s -I uhd -a type=b200,serial=30F9A43 -f 5900000000 -g 20 -o dmrs_data\n", prog);
-}
-
-// 修改参数解析函数，添加配置文件选项
-static void parse_args(prog_args_t* args, int argc, char** argv)
+void parse_args(int argc, char** argv)
 {
   int opt;
-  const char* config_file = NULL;
-  
-  while ((opt = getopt(argc, argv, "c:I:a:f:g:p:C:r:m:n:o:l:v")) != -1) {
+  while ((opt = getopt(argc, argv, "emptv")) != -1) {
     switch (opt) {
-      case 'c':
-        config_file = optarg;
-        break;
-      case 'I':
-        args->rf_dev = strdup(optarg);
-        break;
-      case 'a':
-        args->rf_args = strdup(optarg);
-        break;
-      case 'f':
-        args->rf_freq = atof(optarg);
-        break;
-      case 'g':
-        args->rf_gain = atof(optarg);
-        break;
       case 'p':
-        args->nof_prb = atoi(optarg);
-        break;
-      case 'C':
-        args->cell_id = atoi(optarg);
-        break;
-      case 'r':
-        args->rnti = strtol(optarg, NULL, 16);
+        cell.nof_prb = (uint32_t)strtol(argv[optind], NULL, 10);
         break;
       case 'm':
-        args->mcs = atoi(optarg);
+        mcs_idx = (uint32_t)strtol(argv[optind], NULL, 10);
         break;
-      case 'n':
-        args->nof_subframes = atoi(optarg);
+      case 'e':
+        cell.cp = SRSRAN_CP_EXT;
         break;
-      case 'o':
-        args->output_dir = strdup(optarg);
-        break;
-      case 'l':
-        args->log_file = strdup(optarg);
+      case 't':
+        cell.tm = (srsran_sl_tm_t)(strtol(argv[optind], NULL, 10) - 1);
         break;
       case 'v':
-        increase_srsran_verbose_level();
+        srsran_verbose++;
         break;
       default:
         usage(argv[0]);
         exit(-1);
     }
   }
-  
-  if (config_file) {
-    read_config_file(args, config_file);
-  }
 }
 
-// 记录日志
-static void log_message(const char* filename, const char* format, ...)
+int base_init()
 {
-  FILE* f = fopen(filename, "a");
-  if (f) {
-    va_list args;
-    va_start(args, format);
-    vfprintf(f, format, args);
-    va_end(args);
-    fclose(f);
-  }
-}
+  sf_n_samples = srsran_symbol_sz(cell.nof_prb) * 15;
+  sf_n_re      = SRSRAN_SF_LEN_RE(cell.nof_prb, cell.cp);
 
-// 初始化设备管理器
-static device_manager_t* init_device_manager(uint32_t initial_capacity)
-{
-  device_manager_t* manager = calloc(1, sizeof(device_manager_t));
-  if (manager) {
-    manager->capacity = initial_capacity;
-    manager->num_devices = 0;
-    manager->matrices = calloc(initial_capacity, sizeof(dmrs_matrix_t*));
-    if (!manager->matrices) {
-      free(manager);
-      return NULL;
-    }
-  }
-  return manager;
-}
-
-// 释放设备管理器
-static void free_device_manager(device_manager_t* manager)
-{
-  if (manager) {
-    if (manager->matrices) {
-      for (uint32_t i = 0; i < manager->num_devices; i++) {
-        if (manager->matrices[i]) {
-          free_dmrs_matrix(manager->matrices[i]);
-        }
-      }
-      free(manager->matrices);
-    }
-    free(manager);
-  }
-}
-
-// 扩展设备管理器容量
-static bool expand_device_manager(device_manager_t* manager)
-{
-  uint32_t new_capacity = manager->capacity * 2;
-  dmrs_matrix_t** new_matrices = realloc(manager->matrices, new_capacity * sizeof(dmrs_matrix_t*));
-  if (new_matrices) {
-    // 初始化新分配的空间
-    memset(new_matrices + manager->capacity, 0, (new_capacity - manager->capacity) * sizeof(dmrs_matrix_t*));
-    manager->matrices = new_matrices;
-    manager->capacity = new_capacity;
-    return true;
-  }
-  return false;
-}
-
-// 初始化DMRS矩阵
-static dmrs_matrix_t* init_dmrs_matrix(uint32_t rnti, uint32_t num_samples, uint32_t initial_capacity)
-{
-  dmrs_matrix_t* matrix = calloc(1, sizeof(dmrs_matrix_t));
-  if (matrix) {
-    matrix->rnti = rnti;
-    matrix->num_samples = num_samples;
-    matrix->num_frames = 0;
-    matrix->capacity = initial_capacity;
-    matrix->dmrs_matrix = srsran_vec_cf_malloc(matrix->capacity * num_samples);
-    if (!matrix->dmrs_matrix) {
-      free(matrix);
-      return NULL;
-    }
-  }
-  return matrix;
-}
-
-// 释放DMRS矩阵
-static void free_dmrs_matrix(dmrs_matrix_t* matrix)
-{
-  if (matrix) {
-    if (matrix->dmrs_matrix) {
-      free(matrix->dmrs_matrix);
-    }
-    free(matrix);
-  }
-}
-
-// 扩展DMRS矩阵容量
-static bool expand_dmrs_matrix(dmrs_matrix_t* matrix)
-{
-  uint32_t new_capacity = matrix->capacity * 2;
-  cf_t* new_matrix = srsran_vec_cf_malloc(new_capacity * matrix->num_samples);
-  if (new_matrix) {
-    // 复制现有数据
-    memcpy(new_matrix, matrix->dmrs_matrix, matrix->num_frames * matrix->num_samples * sizeof(cf_t));
-    // 释放旧数据
-    free(matrix->dmrs_matrix);
-    // 更新矩阵
-    matrix->dmrs_matrix = new_matrix;
-    matrix->capacity = new_capacity;
-    return true;
-  }
-  return false;
-}
-
-// 保存DMRS矩阵到MAT文件
-static void save_dmrs_matrix(const char* output_dir, dmrs_matrix_t* matrix)
-{
-  if (!matrix || !matrix->dmrs_matrix || matrix->num_frames == 0) {
-    return;
+  // Initialize PSSCH
+  if (srsran_pssch_init(&pssch, &cell, &sl_comm_resource_pool) != SRSRAN_SUCCESS) {
+    ERROR("Error initializing PSSCH");
+    return SRSRAN_ERROR;
   }
 
-  char filename[256];
-  snprintf(filename, sizeof(filename), "%s/dmrs_rnti_0x%x.mat", output_dir, matrix->rnti);
-  
-  mat_t* matfp = Mat_CreateVer(filename, NULL, MAT_FT_MAT5);
-  if (matfp) {
-    size_t dims[2] = {matrix->num_frames, matrix->num_samples};
-    
-    // 创建临时缓冲区存储数据
-    float* temp_data = malloc(matrix->num_frames * matrix->num_samples * 2 * sizeof(float));
-    if (temp_data) {
-      // 将复数数据转换为实部和虚部
-      for (uint32_t i = 0; i < matrix->num_frames * matrix->num_samples; i++) {
-        temp_data[i*2] = crealf(matrix->dmrs_matrix[i]);
-        temp_data[i*2+1] = cimagf(matrix->dmrs_matrix[i]);
-      }
-      
-      // 创建MAT变量
-      matvar_t* matvar = Mat_VarCreate("dmrs_matrix", MAT_C_SINGLE, MAT_T_SINGLE, 2, dims, temp_data, 0);
-      if (matvar) {
-        Mat_VarWrite(matfp, matvar, MAT_COMPRESSION_NONE);
-        Mat_VarFree(matvar);
-      }
-      free(temp_data);
-    }
-    Mat_Close(matfp);
+  // Initialize PSCCH
+  if (srsran_pscch_init(&pscch, SRSRAN_MAX_PRB) != SRSRAN_SUCCESS) {
+    ERROR("Error in PSCCH init");
+    return SRSRAN_ERROR;
   }
-}
 
-// 查找或创建设备的DMRS矩阵
-static dmrs_matrix_t* get_or_create_matrix(device_manager_t* manager, uint32_t rnti, uint32_t num_samples, uint32_t initial_capacity)
-{
-  // 查找现有矩阵
-  for (uint32_t i = 0; i < manager->num_devices; i++) {
-    if (manager->matrices[i] && manager->matrices[i]->rnti == rnti) {
-      return manager->matrices[i];
-    }
+  if (srsran_pscch_set_cell(&pscch, cell) != SRSRAN_SUCCESS) {
+    ERROR("Error in PSCCH set cell");
+    return SRSRAN_ERROR;
   }
-  
-  // 如果设备数量达到容量上限，扩展管理器
-  if (manager->num_devices >= manager->capacity) {
-    if (!expand_device_manager(manager)) {
-      return NULL;
-    }
-  }
-  
-  // 创建新矩阵
-  dmrs_matrix_t* matrix = init_dmrs_matrix(rnti, num_samples, initial_capacity);
-  if (matrix) {
-    manager->matrices[manager->num_devices++] = matrix;
-  }
-  return matrix;
-}
 
-// 主函数
-int main(int argc, char** argv)
-{
-  // 移除未使用的ret变量
-  prog_args_t prog_args = {0};
-  srsran_rf_t radio;
-  srsran_cell_sl_t cell = {0};
-  srsran_sl_comm_resource_pool_t sl_comm_resource_pool = {0};
-  srsran_pscch_t pscch = {0};
-  srsran_pssch_cfg_t pssch_cfg = {0};
-  srsran_chest_sl_t chest = {0};
-  device_manager_t* device_manager = NULL;
-  
-  // 初始化崩溃处理
-  srsran_debug_handle_crash(argc, argv);
-  
-  // 设置默认参数
-  args_default(&prog_args);
-  
-  // 解析命令行参数
-  parse_args(&prog_args, argc, argv);
-  
-  // 设置信号处理
-  signal(SIGINT, sig_int_handler);
-  
-  // 创建输出目录
-  if (mkdir(prog_args.output_dir, 0755) != 0 && errno != EEXIST) {
-    fprintf(stderr, "Error creating output directory %s\n", prog_args.output_dir);
-    exit(-1);
+  // Initialize SCI
+  if (srsran_sci_init(&sci, &cell, &sl_comm_resource_pool) < SRSRAN_SUCCESS) {
+    ERROR("Error in SCI init");
+    return SRSRAN_ERROR;
   }
-  
-  // 初始化设备管理器
-  device_manager = init_device_manager(prog_args.initial_device_capacity);
-  if (!device_manager) {
-    fprintf(stderr, "Error initializing device manager\n");
-    exit(-1);
+
+  // Initialize channel estimator
+  if (srsran_chest_sl_init(&chest_sl, SRSRAN_SIDELINK_PSSCH, cell, &sl_comm_resource_pool) != SRSRAN_SUCCESS) {
+    ERROR("Error in PSSCH DMRS init");
+    return SRSRAN_ERROR;
   }
-  
-  // 初始化cell结构体
-  cell.tm = SRSRAN_SIDELINK_TM1;
-  cell.N_sl_id = 0;
-  cell.nof_prb = 50;
-  cell.cp = SRSRAN_CP_NORM;
-  
-  // 初始化资源池配置
-  sl_comm_resource_pool.period_length = 40;
-  sl_comm_resource_pool.prb_num = 50;
-  sl_comm_resource_pool.prb_start = 0;
-  sl_comm_resource_pool.prb_end = 49;
-  
-  // 初始化PSSCH配置
-  pssch_cfg.prb_start_idx = 0;
-  pssch_cfg.nof_prb = cell.nof_prb;
-  
-  // 初始化PSSCH对象
-  if (srsran_pssch_init(&pssch, cell.nof_prb) != SRSRAN_SUCCESS) {
-    fprintf(stderr, "Error initializing PSSCH\n");
-    return -1;
+
+  // Initialize FFT
+  if (srsran_ofdm_rx_init(&fft, cell.cp, sf_buffer, sf_buffer, cell.nof_prb)) {
+    ERROR("Error creating FFT object");
+    return SRSRAN_ERROR;
   }
-  
-  // 设置PSSCH配置
-  if (srsran_pssch_set_cell(&pssch, cell) != SRSRAN_SUCCESS) {
-    fprintf(stderr, "Error setting PSSCH cell\n");
-    return -1;
-  }
-  
-  // 打开RF设备
-  if (srsran_rf_open_devname(&radio, prog_args.rf_dev, prog_args.rf_args, 1)) {  // 使用固定值1替代cell.nof_ports
+
+  // Initialize RF
+  if (srsran_rf_open(&rf, "uhd")) {
     ERROR("Error opening RF device");
-    return -1;
+    return SRSRAN_ERROR;
   }
-  
-  // 初始化信道估计
-  if (srsran_chest_sl_init(&chest, cell.nof_prb) != SRSRAN_SUCCESS) {
-    fprintf(stderr, "Error initializing channel estimator\n");
-    return -1;
-  }
-  
-  // 设置信道估计配置
-  srsran_chest_sl_cfg_t chest_cfg = {0};
-  chest_cfg.prb_start_idx = pssch_cfg.prb_start_idx;
-  chest_cfg.nof_prb = pssch_cfg.nof_prb;
-  chest_cfg.N_x_id = cell.N_sl_id;
-  
-  if (srsran_chest_sl_set_cfg(&chest, &chest_cfg) != SRSRAN_SUCCESS) {
-    fprintf(stderr, "Error setting channel estimator config\n");
-    return -1;
-  }
-  
-  // 分配缓冲区
-  cf_t* sf_buffer = srsran_vec_cf_malloc(SRSRAN_SF_LEN_PRB(cell.nof_prb));
+
+  // Allocate buffers
+  sf_buffer = srsran_vec_cf_malloc(sf_n_re);
   if (!sf_buffer) {
     ERROR("Error allocating memory");
-    exit(-1);
+    return SRSRAN_ERROR;
   }
-  
-  // 记录启动信息
-  log_message(prog_args.log_file, "LTE-V接收程序启动\n");
-  log_message(prog_args.log_file, "接收频率: %.2f MHz\n", prog_args.rf_freq/1e6);
-  log_message(prog_args.log_file, "接收增益: %.1f dB\n", prog_args.rf_gain);
-  log_message(prog_args.log_file, "PRB数量: %d\n", prog_args.nof_prb);
-  
-  // 主循环
-  int nf = 0;
-  while ((nf < prog_args.nof_subframes || prog_args.nof_subframes == -1) && !go_exit) {
-    // 接收信号
-    srsran_rf_recv(&radio, sf_buffer, SRSRAN_SF_LEN_PRB(cell.nof_prb), true);
-    
-    // 解码PSCCH获取RNTI
-    uint8_t sci[32];
-    uint32_t detected_rnti = 0;
-    if (srsran_pscch_decode(&pscch, sf_buffer, sci, pssch_cfg.prb_start_idx) == SRSRAN_SUCCESS) {
-      detected_rnti = (sci[0] << 8) | sci[1];  // 从SCI中提取RNTI
-      // 提取DMRS导频
-      cf_t* dmrs_received = NULL;
-      if (srsran_chest_sl_estimate(&chest, sf_buffer, &dmrs_received) == SRSRAN_SUCCESS) {
-        // 获取或创建该RNTI的DMRS矩阵
-        dmrs_matrix_t* matrix = get_or_create_matrix(device_manager, detected_rnti, cell.nof_prb, prog_args.initial_matrix_capacity);
-        
-        if (matrix) {
-          // 如果矩阵已满，扩展容量
-          if (matrix->num_frames >= matrix->capacity) {
-            if (!expand_dmrs_matrix(matrix)) {
-              // 如果扩展失败，保存当前数据并重新初始化
-              save_dmrs_matrix(prog_args.output_dir, matrix);
-              free_dmrs_matrix(matrix);
-              matrix = get_or_create_matrix(device_manager, detected_rnti, cell.nof_prb, prog_args.initial_matrix_capacity);
-            }
-          }
-          
-          if (matrix) {
-            // 添加新的DMRS数据
-            memcpy(matrix->dmrs_matrix + matrix->num_frames * matrix->num_samples,
-                   dmrs_received,
-                   matrix->num_samples * sizeof(cf_t));
-            matrix->num_frames++;
-            
-            // 记录接收信息
-            log_message(prog_args.log_file, "子帧 %d: RNTI=0x%x, 成功接收DMRS导频 (总帧数: %d)\n", 
-                       nf, detected_rnti, matrix->num_frames);
-          }
-        }
-      } else {
-        log_message(prog_args.log_file, "子帧 %d: RNTI=0x%x, DMRS导频提取失败\n", nf, detected_rnti);
-      }
-    } else {
-      log_message(prog_args.log_file, "子帧 %d: PSCCH解码失败\n", nf);
-    }
-    
-    // 更新子帧索引
-    pssch_cfg.sf_idx = (pssch_cfg.sf_idx + 1) % 10;
-    
-    nf++;
-  }
-  
-  // 保存所有设备的DMRS数据
-  for (uint32_t i = 0; i < device_manager->num_devices; i++) {
-    if (device_manager->matrices[i]) {
-      save_dmrs_matrix(prog_args.output_dir, device_manager->matrices[i]);
-    }
-  }
-  
-  // 记录结束信息
-  log_message(prog_args.log_file, "LTE-V接收程序结束，共接收 %d 个子帧\n", nf);
-  
-  // 清理资源
-  free_device_manager(device_manager);
-  srsran_pscch_free(&pscch);
+  srsran_vec_cf_zero(sf_buffer, sf_n_re);
+
+  return SRSRAN_SUCCESS;
+}
+
+void base_free()
+{
   srsran_pssch_free(&pssch);
-  srsran_chest_sl_free(&chest);
-  srsran_rf_close(&radio);
-  free(sf_buffer);
-  
-  printf("Done\n");
-  exit(0);
+  srsran_pscch_free(&pscch);
+  srsran_sci_free(&sci);
+  srsran_chest_sl_free(&chest_sl);
+  srsran_ofdm_rx_free(&fft);
+  srsran_rf_close(&rf);
+
+  if (sf_buffer) {
+    free(sf_buffer);
+  }
+}
+
+int main(int argc, char** argv)
+{
+  int ret = SRSRAN_ERROR;
+
+  parse_args(argc, argv);
+
+  // 设置信号处理
+  signal(SIGINT, sig_int_handler);
+
+  if (base_init() != SRSRAN_SUCCESS) {
+    ERROR("Error in base initialization");
+    goto clean_exit;
+  }
+
+  // Configure PSSCH
+  srsran_pssch_cfg_t pssch_cfg = {
+      .mcs_idx = mcs_idx,
+      .prb_start_idx = prb_start_idx,
+      .nof_prb = cell.nof_prb,
+      .N_x_id = cell.N_sl_id,
+      .sf_idx = 0
+  };
+
+  if (srsran_pssch_set_cfg(&pssch, pssch_cfg) != SRSRAN_SUCCESS) {
+    ERROR("Error configuring PSSCH");
+    goto clean_exit;
+  }
+
+  // Configure channel estimator
+  srsran_chest_sl_cfg_t chest_sl_cfg = {
+      .N_x_id = cell.N_sl_id,
+      .sf_idx = 0,
+      .prb_start_idx = prb_start_idx,
+      .nof_prb = cell.nof_prb
+  };
+
+  if (srsran_chest_sl_set_cfg(&chest_sl, chest_sl_cfg) != SRSRAN_SUCCESS) {
+    ERROR("Error configuring channel estimator");
+    goto clean_exit;
+  }
+
+  // 主循环
+  while (!go_exit) {
+    // Receive signal
+    if (srsran_rf_recv(&rf, sf_buffer, sf_n_samples, true) != SRSRAN_SUCCESS) {
+      ERROR("Error receiving");
+      goto clean_exit;
+    }
+
+    // Convert to frequency domain
+    srsran_ofdm_rx_sf(&fft);
+
+    // Estimate channel
+    cf_t* ce = srsran_vec_cf_malloc(sf_n_re);
+    if (!ce) {
+      ERROR("Error allocating memory");
+      goto clean_exit;
+    }
+
+    if (srsran_chest_sl_ls_estimate(&chest_sl, sf_buffer, ce) != SRSRAN_SUCCESS) {
+      ERROR("Error estimating channel");
+      goto clean_exit;
+    }
+
+    // Decode PSCCH
+    uint8_t sci_msg[SRSRAN_SCI_MAX_LEN];
+    if (srsran_pscch_decode(&pscch, sf_buffer, ce, sci_msg, prb_start_idx) != SRSRAN_SUCCESS) {
+      ERROR("Error decoding PSCCH");
+      goto clean_exit;
+    }
+
+    // Unpack SCI
+    if (srsran_sci_format0_unpack(&sci, sci_msg) != SRSRAN_SUCCESS) {
+      ERROR("Error unpacking SCI");
+      goto clean_exit;
+    }
+
+    // Decode PSSCH
+    uint8_t* data = srsran_vec_u8_malloc(pssch.sl_sch_tb_len);
+    if (!data) {
+      ERROR("Error allocating memory");
+      goto clean_exit;
+    }
+
+    if (srsran_pssch_decode(&pssch, sf_buffer, ce, data) != SRSRAN_SUCCESS) {
+      ERROR("Error decoding PSSCH");
+      goto clean_exit;
+    }
+
+    // Save DMRS to file
+    if (output_file_name) {
+      if (srsran_filesink_init(&fsink, output_file_name, SRSRAN_COMPLEX_FLOAT_BIN) != SRSRAN_SUCCESS) {
+        ERROR("Error opening file");
+        goto clean_exit;
+      }
+
+      // Extract DMRS symbols
+      cf_t* dmrs = srsran_vec_cf_malloc(sf_n_re);
+      if (!dmrs) {
+        ERROR("Error allocating memory");
+        goto clean_exit;
+      }
+
+      if (srsran_chest_sl_get_dmrs(&chest_sl, sf_buffer, dmrs) != SRSRAN_SUCCESS) {
+        ERROR("Error extracting DMRS");
+        goto clean_exit;
+      }
+
+      // Write DMRS to file
+      srsran_filesink_write(&fsink, dmrs, sf_n_re);
+      srsran_filesink_free(&fsink);
+      free(dmrs);
+    }
+
+    free(ce);
+    free(data);
+  }
+
+  ret = SRSRAN_SUCCESS;
+
+clean_exit:
+  base_free();
+  return ret;
 } 

@@ -41,6 +41,12 @@
 #define MAX_SF_BUFFER_SIZE (15 * 2048)
 
 static srsran_cell_sl_t cell = {.nof_prb = 6, .N_sl_id = 0, .tm = SRSRAN_SIDELINK_TM2, .cp = SRSRAN_CP_NORM};
+static srsran_sl_comm_resource_pool_t sl_comm_resource_pool = {
+    .period_length = 40,
+    .prb_num = 6,
+    .prb_start = 0,
+    .prb_end = 5
+};
 
 static uint32_t        mcs_idx       = 4;
 static uint32_t        prb_start_idx = 0;
@@ -48,7 +54,7 @@ static uint32_t        sf_n_samples  = 0;
 static uint32_t        sf_n_re       = 0;
 static cf_t*           sf_buffer     = NULL;
 static srsran_ofdm_t   fft;
-static srsran_radio_t  radio;
+static srsran_rf_t     rf;
 static srsran_pssch_t  pssch;
 static srsran_pscch_t  pscch;
 static srsran_sci_t    sci;
@@ -150,9 +156,9 @@ int base_init()
     return SRSRAN_ERROR;
   }
 
-  // Initialize radio
-  if (srsran_radio_init(&radio, NULL)) {
-    ERROR("Error initializing radio");
+  // Initialize RF
+  if (srsran_rf_open(&rf, "uhd")) {
+    ERROR("Error opening RF device");
     return SRSRAN_ERROR;
   }
 
@@ -174,7 +180,7 @@ void base_free()
   srsran_sci_free(&sci);
   srsran_chest_sl_free(&chest_sl);
   srsran_ofdm_tx_free(&fft);
-  srsran_radio_free(&radio);
+  srsran_rf_close(&rf);
 
   if (sf_buffer) {
     free(sf_buffer);
@@ -254,7 +260,7 @@ int main(int argc, char** argv)
     }
 
     // Encode PSSCH
-    if (srsran_pssch_encode(&pssch, data, sf_buffer) != SRSRAN_SUCCESS) {
+    if (srsran_pssch_encode(&pssch, data, pssch.sl_sch_tb_len, sf_buffer) != SRSRAN_SUCCESS) {
       ERROR("Error encoding PSSCH");
       goto clean_exit;
     }
@@ -269,7 +275,7 @@ int main(int argc, char** argv)
     srsran_ofdm_tx_sf(&fft);
 
     // Transmit
-    if (srsran_radio_tx(&radio, sf_buffer, sf_n_samples, 0, 0, 0) != SRSRAN_SUCCESS) {
+    if (srsran_rf_send(&rf, sf_buffer, sf_n_samples, true) != SRSRAN_SUCCESS) {
       ERROR("Error transmitting");
       goto clean_exit;
     }
