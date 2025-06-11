@@ -19,35 +19,24 @@
  *
  */
 
-#include <assert.h>
-#include <math.h>
-#include <pthread.h>
-#include <semaphore.h>
-#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
-#include <sys/time.h>
 #include <unistd.h>
-#include <stdarg.h>
-#include <libconfig.h>
-#include <matio.h>
-#include <sys/stat.h>
+#include <signal.h>
+#include <inttypes.h>
 
-#include "srsran/phy/common/phy_common.h"
+#include "srsran/phy/ch_estimation/chest_sl.h"
 #include "srsran/phy/common/phy_common_sl.h"
 #include "srsran/phy/dft/ofdm.h"
 #include "srsran/phy/io/filesink.h"
 #include "srsran/phy/phch/pscch.h"
 #include "srsran/phy/phch/pssch.h"
 #include "srsran/phy/phch/sci.h"
-#include "srsran/phy/rf/rf.h"
-#include "srsran/srsran.h"
-#include "srsran/phy/ch_estimation/chest_sl.h"
 #include "srsran/phy/utils/debug.h"
 #include "srsran/phy/utils/vector.h"
-#include "srsran/radio/radio.h"
+#include "srsran/rf/rf.h"
 
 // 全局变量
 volatile bool go_exit = false;

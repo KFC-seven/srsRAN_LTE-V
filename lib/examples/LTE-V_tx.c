@@ -25,6 +25,7 @@
 #include <strings.h>
 #include <unistd.h>
 #include <signal.h>
+#include <inttypes.h>
 
 #include "srsran/phy/ch_estimation/chest_sl.h"
 #include "srsran/phy/common/phy_common_sl.h"
@@ -35,7 +36,7 @@
 #include "srsran/phy/phch/sci.h"
 #include "srsran/phy/utils/debug.h"
 #include "srsran/phy/utils/vector.h"
-#include "srsran/radio/radio.h"
+#include "srsran/rf/rf.h"
 
 #define MAX_SF_BUFFER_SIZE (15 * 2048)
 

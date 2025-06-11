@@ -109,10 +109,15 @@ endif(RF_FOUND)
 # Add eNB/UE IQ test
 add_subdirectory(test)
 
-# LTE-V发射端程序
-add_executable(LTE-V_tx LTE-V_tx.c)
-target_link_libraries(LTE-V_tx srsran_phy srsran_common srsran_rf srsran_phy_common)
+# Set C++ standard
+set(CMAKE_CXX_STANDARD 11)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# LTE-V接收端程序
+# Add LTE-V examples
+add_executable(LTE-V_tx LTE-V_tx.c)
+target_link_libraries(LTE-V_tx srsran_rf srsran_phy srsran_common)
+target_compile_definitions(LTE-V_tx PRIVATE ENABLE_GUI=0)
+
 add_executable(LTE-V_rx LTE-V_rx.c)
-target_link_libraries(LTE-V_rx srsran_phy srsran_common srsran_rf srsran_phy_common matio)
+target_link_libraries(LTE-V_rx srsran_rf srsran_phy srsran_common)
+target_compile_definitions(LTE-V_rx PRIVATE ENABLE_GUI=0)
