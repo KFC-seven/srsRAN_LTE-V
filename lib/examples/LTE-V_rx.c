@@ -36,12 +36,18 @@
 #include <sys/stat.h>
 
 #include "srsran/phy/common/phy_common.h"
+#include "srsran/phy/common/phy_common_sl.h"
+#include "srsran/phy/dft/ofdm.h"
+#include "srsran/phy/io/filesink.h"
 #include "srsran/phy/phch/pscch.h"
 #include "srsran/phy/phch/pssch.h"
+#include "srsran/phy/phch/sci.h"
 #include "srsran/phy/rf/rf.h"
 #include "srsran/srsran.h"
-#include "srsran/phy/ch_estimation/chest_ul.h"
+#include "srsran/phy/ch_estimation/chest_sl.h"
 #include "srsran/phy/utils/debug.h"
+#include "srsran/phy/utils/vector.h"
+#include "srsran/radio/radio.h"
 
 // 全局变量
 volatile bool go_exit = false;

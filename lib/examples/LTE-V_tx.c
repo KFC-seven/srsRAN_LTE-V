@@ -19,156 +19,73 @@
  *
  */
 
-#include <assert.h>
-#include <math.h>
-#include <pthread.h>
-#include <semaphore.h>
-#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
-#include <sys/time.h>
 #include <unistd.h>
-#include <stdarg.h>
 
-#include "srsran/phy/common/phy_common.h"
+#include "srsran/phy/ch_estimation/chest_sl.h"
+#include "srsran/phy/common/phy_common_sl.h"
+#include "srsran/phy/dft/ofdm.h"
+#include "srsran/phy/io/filesource.h"
 #include "srsran/phy/phch/pscch.h"
 #include "srsran/phy/phch/pssch.h"
-#include "srsran/phy/rf/rf.h"
-#include "srsran/srsran.h"
+#include "srsran/phy/phch/sci.h"
 #include "srsran/phy/utils/debug.h"
+#include "srsran/phy/utils/vector.h"
+#include "srsran/radio/radio.h"
 
-// 全局变量
-volatile bool go_exit = false;
+#define MAX_SF_BUFFER_SIZE (15 * 2048)
 
-// 程序参数结构体
-typedef struct {
-  // RF设备配置
-  char* rf_dev;
-  char* rf_args;
-  float rf_freq;
-  float rf_gain;
-  uint32_t nof_tx_antennas;
+static srsran_cell_sl_t cell = {.nof_prb = 6, .N_sl_id = 0, .tm = SRSRAN_SIDELINK_TM2, .cp = SRSRAN_CP_NORM};
 
-  // LTE-V基本参数
-  uint32_t nof_prb;
-  uint32_t nof_ports;
-  uint32_t cell_id;
-  uint32_t rnti;
-  uint32_t mcs;
-  uint32_t rv;
+static uint32_t        mcs_idx       = 4;
+static uint32_t        prb_start_idx = 0;
+static uint32_t        sf_n_samples  = 0;
+static uint32_t        sf_n_re       = 0;
+static cf_t*           sf_buffer     = NULL;
+static srsran_ofdm_t   fft;
+static srsran_radio_t  radio;
+static srsran_pssch_t  pssch;
+static srsran_pscch_t  pscch;
+static srsran_sci_t    sci;
+static srsran_chest_sl_t chest_sl;
 
-  // LTE-V高级参数
-  uint32_t size_sub_channel;
-  uint32_t num_sub_channel;
-  uint32_t tdd_config;
-  uint32_t tdd_special_sf;
-  bool enable_256qam;
+static char*            input_file_name = NULL;
+static srsran_filesource_t fsrc;
+static bool             use_standard_lte_rates = false;
+static uint32_t         file_offset            = 0;
 
-  // 高级配置
-  bool use_standard_lte_rates;
-  int nof_subframes;
-  
-  // 文件配置
-  char* log_file;
-} prog_args_t;
-
-// 默认参数设置
-static void args_default(prog_args_t* args)
+void usage(char* prog)
 {
-  args->rf_dev = "uhd";
-  args->rf_args = "type=b205i";
-  args->rf_freq = 5900000000; // 5.9GHz for V2X
-  args->rf_gain = 20;
-  args->nof_tx_antennas = 1;
-
-  args->nof_prb = 25;
-  args->nof_ports = 1;
-  args->cell_id = 1;
-  args->rnti = 0x1234;
-  args->mcs = 10;
-  args->rv = 0;
-
-  args->size_sub_channel = 10;
-  args->num_sub_channel = 1;
-  args->tdd_config = 0;
-  args->tdd_special_sf = 0;
-  args->enable_256qam = false;
-
-  args->use_standard_lte_rates = false;
-  args->nof_subframes = -1;
-  
-  args->log_file = "ltev_tx.log";
+  printf("Usage: %s [emptv]\n", prog);
+  printf("\t-p nof_prb [Default %d]\n", cell.nof_prb);
+  printf("\t-m mcs_idx [Default %d]\n", mcs_idx);
+  printf("\t-e extended CP [Default normal]\n");
+  printf("\t-t Sidelink transmission mode {1,2,3,4} [Default %d]\n", (cell.tm + 1));
+  printf("\t-v [set srsran_verbose to debug, default none]\n");
 }
 
-// 信号处理函数
-static void sig_int_handler(int signo)
-{
-  printf("SIGINT received. Exiting...\n");
-  if (signo == SIGINT) {
-    go_exit = true;
-  }
-}
-
-// 使用说明
-static void usage(char* prog)
-{
-  printf("Usage: %s [选项]\n", prog);
-  printf("选项:\n");
-  printf("  -I <设备名称>    覆盖配置文件中的device_name\n");
-  printf("  -a <设备参数>    覆盖配置文件中的device_args\n");
-  printf("  -f <频率>        覆盖配置文件中的tx_freq (Hz)\n");
-  printf("  -g <增益>        覆盖配置文件中的tx_gain (dB)\n");
-  printf("  -p <PRB数>       覆盖配置文件中的nof_prb\n");
-  printf("  -c <小区ID>      覆盖配置文件中的cell_id\n");
-  printf("  -r <RNTI>        覆盖配置文件中的rnti (十六进制)\n");
-  printf("  -m <MCS>         覆盖配置文件中的mcs\n");
-  printf("  -n <子帧数>      覆盖配置文件中的nof_subframes\n");
-  printf("  -l <日志文件>    日志文件名\n");
-  printf("  -v               增加详细输出\n");
-  printf("\n示例:\n");
-  printf("  %s -I uhd -a type=b205i -f 5900000000 -g 20\n", prog);
-}
-
-// 参数解析
-static void parse_args(prog_args_t* args, int argc, char** argv)
+void parse_args(int argc, char** argv)
 {
   int opt;
-  while ((opt = getopt(argc, argv, "I:a:f:g:p:c:r:m:n:l:v")) != -1) {
+  while ((opt = getopt(argc, argv, "emptv")) != -1) {
     switch (opt) {
-      case 'I':
-        args->rf_dev = strdup(optarg);
-        break;
-      case 'a':
-        args->rf_args = strdup(optarg);
-        break;
-      case 'f':
-        args->rf_freq = atof(optarg);
-        break;
-      case 'g':
-        args->rf_gain = atof(optarg);
-        break;
       case 'p':
-        args->nof_prb = atoi(optarg);
-        break;
-      case 'c':
-        args->cell_id = atoi(optarg);
-        break;
-      case 'r':
-        args->rnti = strtol(optarg, NULL, 16);
+        cell.nof_prb = (uint32_t)strtol(argv[optind], NULL, 10);
         break;
       case 'm':
-        args->mcs = atoi(optarg);
+        mcs_idx = (uint32_t)strtol(argv[optind], NULL, 10);
         break;
-      case 'n':
-        args->nof_subframes = atoi(optarg);
+      case 'e':
+        cell.cp = SRSRAN_CP_EXT;
         break;
-      case 'l':
-        args->log_file = strdup(optarg);
+      case 't':
+        cell.tm = (srsran_sl_tm_t)(strtol(argv[optind], NULL, 10) - 1);
         break;
       case 'v':
-        increase_srsran_verbose_level();
+        srsran_verbose++;
         break;
       default:
         usage(argv[0]);
@@ -177,124 +94,166 @@ static void parse_args(prog_args_t* args, int argc, char** argv)
   }
 }
 
-// 记录日志
-static void log_message(const char* filename, const char* format, ...)
+int base_init()
 {
-  FILE* f = fopen(filename, "a");
-  if (f) {
-    va_list args;
-    va_start(args, format);
-    vfprintf(f, format, args);
-    va_end(args);
-    fclose(f);
+  sf_n_samples = srsran_symbol_sz(cell.nof_prb) * 15;
+  sf_n_re      = SRSRAN_SF_LEN_RE(cell.nof_prb, cell.cp);
+
+  // Initialize PSSCH
+  if (srsran_pssch_init(&pssch, &cell, &sl_comm_resource_pool) != SRSRAN_SUCCESS) {
+    ERROR("Error initializing PSSCH");
+    return SRSRAN_ERROR;
+  }
+
+  // Initialize PSCCH
+  if (srsran_pscch_init(&pscch, SRSRAN_MAX_PRB) != SRSRAN_SUCCESS) {
+    ERROR("Error in PSCCH init");
+    return SRSRAN_ERROR;
+  }
+
+  if (srsran_pscch_set_cell(&pscch, cell) != SRSRAN_SUCCESS) {
+    ERROR("Error in PSCCH set cell");
+    return SRSRAN_ERROR;
+  }
+
+  // Initialize SCI
+  if (srsran_sci_init(&sci, &cell, &sl_comm_resource_pool) < SRSRAN_SUCCESS) {
+    ERROR("Error in SCI init");
+    return SRSRAN_ERROR;
+  }
+
+  // Initialize channel estimator
+  if (srsran_chest_sl_init(&chest_sl, SRSRAN_SIDELINK_PSSCH, cell, &sl_comm_resource_pool) != SRSRAN_SUCCESS) {
+    ERROR("Error in PSSCH DMRS init");
+    return SRSRAN_ERROR;
+  }
+
+  // Initialize FFT
+  if (srsran_ofdm_tx_init(&fft, cell.cp, sf_buffer, sf_buffer, cell.nof_prb)) {
+    ERROR("Error creating FFT object");
+    return SRSRAN_ERROR;
+  }
+
+  // Initialize radio
+  if (srsran_radio_init(&radio, NULL)) {
+    ERROR("Error initializing radio");
+    return SRSRAN_ERROR;
+  }
+
+  // Allocate buffers
+  sf_buffer = srsran_vec_cf_malloc(sf_n_re);
+  if (!sf_buffer) {
+    ERROR("Error allocating memory");
+    return SRSRAN_ERROR;
+  }
+  srsran_vec_cf_zero(sf_buffer, sf_n_re);
+
+  return SRSRAN_SUCCESS;
+}
+
+void base_free()
+{
+  srsran_pssch_free(&pssch);
+  srsran_pscch_free(&pscch);
+  srsran_sci_free(&sci);
+  srsran_chest_sl_free(&chest_sl);
+  srsran_ofdm_tx_free(&fft);
+  srsran_radio_free(&radio);
+
+  if (sf_buffer) {
+    free(sf_buffer);
   }
 }
 
-// 主函数
 int main(int argc, char** argv)
 {
-  prog_args_t prog_args = {0};
-  srsran_rf_t radio;
-  srsran_cell_sl_t cell = {0};
-  srsran_sl_comm_resource_pool_t sl_comm_resource_pool = {0};
-  srsran_pscch_t pscch = {0};
-  srsran_pssch_t pssch = {0};
-  srsran_pssch_cfg_t pssch_cfg = {0};
-  srsran_dci_format_t sci = {0};  // 使用dci_format_t替代sci_format0_t
-  
-  // 初始化崩溃处理
-  srsran_debug_handle_crash(argc, argv);
-  
-  // 设置默认参数
-  args_default(&prog_args);
-  
-  // 解析命令行参数
-  parse_args(&prog_args, argc, argv);
-  
-  // 设置信号处理
-  signal(SIGINT, sig_int_handler);
-  
-  // 设置cell参数
-  cell.tm = SRSRAN_SIDELINK_TM1;
-  cell.N_sl_id = 0;
-  cell.nof_prb = 50;
-  cell.cp = SRSRAN_CP_NORM;
-  
-  // 初始化资源池配置
-  sl_comm_resource_pool.period_length = 40;
-  sl_comm_resource_pool.prb_num = 50;
-  sl_comm_resource_pool.prb_start = 0;
-  sl_comm_resource_pool.prb_end = 49;
-  
-  // 初始化PSSCH配置
-  pssch_cfg.prb_start_idx = 0;
-  pssch_cfg.nof_prb = cell.nof_prb;
-  
-  // 初始化PSSCH对象
-  if (srsran_pssch_init(&pssch, cell.nof_prb) != SRSRAN_SUCCESS) {
-    fprintf(stderr, "Error initializing PSSCH\n");
-    return -1;
+  int ret = SRSRAN_ERROR;
+
+  parse_args(argc, argv);
+
+  if (base_init() != SRSRAN_SUCCESS) {
+    ERROR("Error in base initialization");
+    goto clean_exit;
   }
-  
-  // 设置PSSCH配置
-  if (srsran_pssch_set_cell(&pssch, cell) != SRSRAN_SUCCESS) {
-    fprintf(stderr, "Error setting PSSCH cell\n");
-    return -1;
+
+  // Configure PSSCH
+  srsran_pssch_cfg_t pssch_cfg = {
+      .mcs_idx = mcs_idx,
+      .prb_start_idx = prb_start_idx,
+      .nof_prb = cell.nof_prb,
+      .N_x_id = cell.N_sl_id,
+      .sf_idx = 0
+  };
+
+  if (srsran_pssch_set_cfg(&pssch, pssch_cfg) != SRSRAN_SUCCESS) {
+    ERROR("Error configuring PSSCH");
+    goto clean_exit;
   }
-  
-  // 打开RF设备
-  if (srsran_rf_open_devname(&radio, prog_args.rf_dev, prog_args.rf_args, 1)) {  // 使用固定值1替代cell.nof_ports
-    ERROR("Error opening RF device");
-    return -1;
+
+  // Configure channel estimator
+  srsran_chest_sl_cfg_t chest_sl_cfg = {
+      .N_x_id = cell.N_sl_id,
+      .sf_idx = 0,
+      .prb_start_idx = prb_start_idx,
+      .nof_prb = cell.nof_prb
+  };
+
+  if (srsran_chest_sl_set_cfg(&chest_sl, chest_sl_cfg) != SRSRAN_SUCCESS) {
+    ERROR("Error configuring channel estimator");
+    goto clean_exit;
   }
-  
-  // 配置RF参数
-  srsran_rf_set_tx_freq(&radio, 0, prog_args.rf_freq);
-  srsran_rf_set_tx_gain(&radio, prog_args.rf_gain);
-  
-  // 初始化PSCCH
-  if (srsran_pscch_init(&pscch, cell.nof_prb) != SRSRAN_SUCCESS) {
-    ERROR("Error initializing PSCCH");
-    return -1;
+
+  // Generate SCI
+  uint8_t sci_msg[SRSRAN_SCI_MAX_LEN];
+  if (srsran_sci_format0_pack(&sci, sci_msg) != SRSRAN_SUCCESS) {
+    ERROR("Error packing SCI");
+    goto clean_exit;
   }
-  
-  // 准备发送数据
-  uint8_t* data = malloc(1000);
+
+  // Encode PSCCH
+  if (srsran_pscch_encode(&pscch, sci_msg, sf_buffer, prb_start_idx) != SRSRAN_SUCCESS) {
+    ERROR("Error encoding PSCCH");
+    goto clean_exit;
+  }
+
+  // Generate random data for PSSCH
+  uint8_t* data = srsran_vec_u8_malloc(pssch.sl_sch_tb_len);
   if (!data) {
     ERROR("Error allocating memory");
-    return -1;
+    goto clean_exit;
   }
-  
-  // 生成随机数据
-  for (int i = 0; i < 1000; i++) {
+
+  for (int i = 0; i < pssch.sl_sch_tb_len; i++) {
     data[i] = rand() % 256;
   }
-  
-  // 发送数据
-  cf_t* sf_buffer = srsran_vec_cf_malloc(SRSRAN_SF_LEN_PRB(cell.nof_prb));
-  if (!sf_buffer) {
-    ERROR("Error allocating memory");
-    free(data);
-    return -1;
-  }
-  
-  // 编码并发送数据
-  if (srsran_pssch_encode(&pssch, data, 1000, sf_buffer) != SRSRAN_SUCCESS) {
+
+  // Encode PSSCH
+  if (srsran_pssch_encode(&pssch, data, sf_buffer) != SRSRAN_SUCCESS) {
     ERROR("Error encoding PSSCH");
-    free(data);
-    free(sf_buffer);
-    return -1;
+    goto clean_exit;
   }
-  
-  // 发送信号
-  srsran_rf_send(&radio, sf_buffer, SRSRAN_SF_LEN_PRB(cell.nof_prb), true);
-  
-  // 清理资源
-  free(data);
-  free(sf_buffer);
-  srsran_pscch_free(&pscch);
-  srsran_pssch_free(&pssch);
-  srsran_rf_close(&radio);
-  
-  return 0;
+
+  // Add DMRS
+  if (srsran_chest_sl_put_dmrs(&chest_sl, sf_buffer) != SRSRAN_SUCCESS) {
+    ERROR("Error adding DMRS");
+    goto clean_exit;
+  }
+
+  // Convert to time domain
+  srsran_ofdm_tx_sf(&fft);
+
+  // Transmit
+  if (srsran_radio_tx(&radio, sf_buffer, sf_n_samples, 0, 0, 0) != SRSRAN_SUCCESS) {
+    ERROR("Error transmitting");
+    goto clean_exit;
+  }
+
+  ret = SRSRAN_SUCCESS;
+
+clean_exit:
+  base_free();
+  if (data) {
+    free(data);
+  }
+  return ret;
 } 
