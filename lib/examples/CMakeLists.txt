@@ -108,3 +108,11 @@ endif(RF_FOUND)
 
 # Add eNB/UE IQ test
 add_subdirectory(test)
+
+# LTE-V发射端程序
+add_executable(LTE-V_tx LTE-V_tx.c)
+target_link_libraries(LTE-V_tx srsran_phy srsran_common srsran_rf srsran_phy_common)
+
+# LTE-V接收端程序
+add_executable(LTE-V_rx LTE-V_rx.c)
+target_link_libraries(LTE-V_rx srsran_phy srsran_common srsran_rf srsran_phy_common matio)
