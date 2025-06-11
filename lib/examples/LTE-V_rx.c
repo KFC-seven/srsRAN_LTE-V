@@ -36,7 +36,7 @@
 #include "srsran/phy/phch/sci.h"
 #include "srsran/phy/utils/debug.h"
 #include "srsran/phy/utils/vector.h"
-#include "srsran/rf/rf.h"
+#include "srsran/phy/rf/rf.h"
 
 // 全局变量
 volatile bool go_exit = false;

@@ -36,7 +36,7 @@
 #include "srsran/phy/phch/sci.h"
 #include "srsran/phy/utils/debug.h"
 #include "srsran/phy/utils/vector.h"
-#include "srsran/rf/rf.h"
+#include "srsran/phy/rf/rf.h"
 
 #define MAX_SF_BUFFER_SIZE (15 * 2048)
 
