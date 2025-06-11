@@ -135,11 +135,106 @@ static void sig_int_handler(int signo)
   }
 }
 
-// 使用说明
+// 从配置文件读取参数
+static void read_config_file(prog_args_t* args, const char* filename)
+{
+  config_t config;
+  config_init(&config);
+  
+  if (config_read_file(&config, filename) == CONFIG_FALSE) {
+    fprintf(stderr, "Error reading config file: %s\n", config_error_text(&config));
+    config_destroy(&config);
+    return;
+  }
+  
+  // 读取RF配置
+  const char* device_name;
+  if (config_lookup_string(&config, "rf.device_name", &device_name)) {
+    args->rf_dev = strdup(device_name);
+  }
+  
+  const char* device_args;
+  if (config_lookup_string(&config, "rf.device_args", &device_args)) {
+    args->rf_args = strdup(device_args);
+  }
+  
+  double freq;
+  if (config_lookup_float(&config, "rf.rx_freq", &freq)) {
+    args->rf_freq = freq;
+  }
+  
+  double gain;
+  if (config_lookup_float(&config, "rf.rx_gain", &gain)) {
+    args->rf_gain = gain;
+  }
+  
+  int nof_rx_antennas;
+  if (config_lookup_int(&config, "rf.nof_rx_antennas", &nof_rx_antennas)) {
+    args->nof_rx_antennas = nof_rx_antennas;
+  }
+  
+  // 读取Sidelink配置
+  int nof_prb;
+  if (config_lookup_int(&config, "sidelink.nof_prb", &nof_prb)) {
+    args->nof_prb = nof_prb;
+  }
+  
+  int nof_ports;
+  if (config_lookup_int(&config, "sidelink.nof_ports", &nof_ports)) {
+    args->nof_ports = nof_ports;
+  }
+  
+  int cell_id;
+  if (config_lookup_int(&config, "sidelink.cell_id", &cell_id)) {
+    args->cell_id = cell_id;
+  }
+  
+  int rnti;
+  if (config_lookup_int(&config, "sidelink.rnti", &rnti)) {
+    args->rnti = rnti;
+  }
+  
+  int mcs;
+  if (config_lookup_int(&config, "sidelink.mcs", &mcs)) {
+    args->mcs = mcs;
+  }
+  
+  int rv;
+  if (config_lookup_int(&config, "sidelink.rv", &rv)) {
+    args->rv = rv;
+  }
+  
+  // 读取文件配置
+  const char* output_dir;
+  if (config_lookup_string(&config, "file.output_dir", &output_dir)) {
+    args->output_dir = strdup(output_dir);
+  }
+  
+  const char* log_file;
+  if (config_lookup_string(&config, "file.log_file", &log_file)) {
+    args->log_file = strdup(log_file);
+  }
+  
+  // 读取DMRS配置
+  int initial_matrix_capacity;
+  if (config_lookup_int(&config, "dmrs.initial_matrix_capacity", &initial_matrix_capacity)) {
+    args->initial_matrix_capacity = initial_matrix_capacity;
+  }
+  
+  int initial_device_capacity;
+  if (config_lookup_int(&config, "dmrs.initial_device_capacity", &initial_device_capacity)) {
+    args->initial_device_capacity = initial_device_capacity;
+  }
+  
+  config_destroy(&config);
+}
+
+// 修改usage函数，添加配置文件选项
 static void usage(char* prog)
 {
   printf("Usage: %s [选项]\n", prog);
   printf("选项:\n");
+  printf("  -c <配置文件>    指定配置文件路径\n");
   printf("  -I <设备名称>    覆盖配置文件中的device_name\n");
   printf("  -a <设备参数>    覆盖配置文件中的device_args\n");
   printf("  -f <频率>        覆盖配置文件中的rx_freq (Hz)\n");
@@ -153,15 +248,21 @@ static void usage(char* prog)
   printf("  -l <日志文件>    日志文件名\n");
   printf("  -v               增加详细输出\n");
   printf("\n示例:\n");
+  printf("  %s -c LTE-V_rx.conf\n", prog);
   printf("  %s -I uhd -a type=b200,serial=30F9A43 -f 5900000000 -g 20 -o dmrs_data\n", prog);
 }
 
-// 参数解析
+// 修改参数解析函数，添加配置文件选项
 static void parse_args(prog_args_t* args, int argc, char** argv)
 {
   int opt;
-  while ((opt = getopt(argc, argv, "I:a:f:g:p:c:r:m:n:o:l:v")) != -1) {
+  const char* config_file = NULL;
+  
+  while ((opt = getopt(argc, argv, "c:I:a:f:g:p:c:r:m:n:o:l:v")) != -1) {
     switch (opt) {
+      case 'c':
+        config_file = optarg;
+        break;
       case 'I':
         args->rf_dev = strdup(optarg);
         break;
@@ -202,6 +303,11 @@ static void parse_args(prog_args_t* args, int argc, char** argv)
         usage(argv[0]);
         exit(-1);
     }
+  }
+  
+  // 如果指定了配置文件，则读取配置文件
+  if (config_file) {
+    read_config_file(args, config_file);
   }
 }
 
