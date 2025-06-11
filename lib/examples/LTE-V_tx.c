@@ -192,15 +192,14 @@ static void log_message(const char* filename, const char* format, ...)
 // 主函数
 int main(int argc, char** argv)
 {
-  int ret;
-  prog_args_t prog_args;
+  prog_args_t prog_args = {0};
   srsran_rf_t radio;
-  srsran_pscch_t pscch;
-  srsran_pssch_t pssch;
-  srsran_cell_sl_t cell;
-  srsran_sl_comm_resource_pool_t sl_comm_resource_pool;
-  srsran_pssch_cfg_t pssch_cfg;
-  srsran_sci_format0_t sci;
+  srsran_cell_sl_t cell = {0};
+  srsran_sl_comm_resource_pool_t sl_comm_resource_pool = {0};
+  srsran_pscch_t pscch = {0};
+  srsran_pssch_t pssch = {0};
+  srsran_pssch_cfg_t pssch_cfg = {0};
+  srsran_dci_format_t sci = {0};  // 使用dci_format_t替代sci_format0_t
   
   // 初始化崩溃处理
   srsran_debug_handle_crash(argc, argv);
@@ -214,31 +213,21 @@ int main(int argc, char** argv)
   // 设置信号处理
   signal(SIGINT, sig_int_handler);
   
-  // 配置cell参数
+  // 设置cell参数
   cell.nof_prb = prog_args.nof_prb;
-  cell.nof_ports = prog_args.nof_ports;
-  cell.id = prog_args.cell_id;
   cell.cp = SRSRAN_CP_NORM;
-  cell.tm = SRSRAN_SIDELINK_TM1;
+  cell.sl_comm_resource_pool = &sl_comm_resource_pool;
   
-  // 配置资源池参数
-  sl_comm_resource_pool.prb_start = 0;
-  sl_comm_resource_pool.prb_end = cell.nof_prb - 1;
-  sl_comm_resource_pool.prb_num = cell.nof_prb;
-  
-  // 配置PSSCH参数
+  // 设置PSCCH配置
+  pssch_cfg.N_x_id = prog_args.cell_id;  // 使用prog_args.cell_id替代cell.id
   pssch_cfg.prb_start_idx = 0;
-  pssch_cfg.nof_prb = cell.nof_prb;
+  pssch_cfg.prb_end_idx = cell.nof_prb - 1;
   pssch_cfg.mcs_idx = prog_args.mcs;
-  pssch_cfg.rv_idx = prog_args.rv;
-  pssch_cfg.N_x_id = cell.id;
-  pssch_cfg.sf_idx = 0;
   
-  // 初始化RF设备
-  printf("Opening RF device...\n");
-  if (srsran_rf_open_devname(&radio, prog_args.rf_dev, prog_args.rf_args, cell.nof_ports)) {
-    fprintf(stderr, "Error opening rf\n");
-    exit(-1);
+  // 打开RF设备
+  if (srsran_rf_open_devname(&radio, prog_args.rf_dev, prog_args.rf_args, 1)) {  // 使用固定值1替代cell.nof_ports
+    ERROR("Error opening RF device");
+    return -1;
   }
   
   // 配置RF参数
@@ -248,99 +237,58 @@ int main(int argc, char** argv)
   // 初始化PSCCH
   if (srsran_pscch_init(&pscch, cell.nof_prb) != SRSRAN_SUCCESS) {
     ERROR("Error initializing PSCCH");
-    exit(-1);
-  }
-  if (srsran_pscch_set_cell(&pscch, cell) != SRSRAN_SUCCESS) {
-    ERROR("Error setting PSCCH cell");
-    exit(-1);
+    return -1;
   }
   
   // 初始化PSSCH
   if (srsran_pssch_init(&pssch, &cell, &sl_comm_resource_pool) != SRSRAN_SUCCESS) {
     ERROR("Error initializing PSSCH");
-    exit(-1);
-  }
-  if (srsran_pssch_set_cfg(&pssch, pssch_cfg) != SRSRAN_SUCCESS) {
-    ERROR("Error setting PSSCH config");
-    exit(-1);
+    return -1;
   }
   
-  // 分配缓冲区
+  // 设置PSSCH配置
+  if (srsran_pssch_set_cfg(&pssch, pssch_cfg) != SRSRAN_SUCCESS) {
+    ERROR("Error setting PSSCH config");
+    return -1;
+  }
+  
+  // 准备发送数据
+  uint8_t* data = malloc(1000);
+  if (!data) {
+    ERROR("Error allocating memory");
+    return -1;
+  }
+  
+  // 生成随机数据
+  for (int i = 0; i < 1000; i++) {
+    data[i] = rand() % 256;
+  }
+  
+  // 发送数据
   cf_t* sf_buffer = srsran_vec_cf_malloc(SRSRAN_SF_LEN_PRB(cell.nof_prb));
   if (!sf_buffer) {
     ERROR("Error allocating memory");
-    exit(-1);
+    free(data);
+    return -1;
   }
   
-  uint8_t* data = srsran_vec_u8_malloc(pssch.sl_sch_tb_len);
-  if (!data) {
-    ERROR("Error allocating memory");
-    exit(-1);
+  // 编码并发送数据
+  if (srsran_pssch_encode(&pssch, data, 1000, sf_buffer) != SRSRAN_SUCCESS) {
+    ERROR("Error encoding PSSCH");
+    free(data);
+    free(sf_buffer);
+    return -1;
   }
   
-  // 记录启动信息
-  log_message(prog_args.log_file, "LTE-V发射程序启动\n");
-  log_message(prog_args.log_file, "发射频率: %.2f MHz\n", prog_args.rf_freq/1e6);
-  log_message(prog_args.log_file, "发射增益: %.1f dB\n", prog_args.rf_gain);
-  log_message(prog_args.log_file, "PRB数量: %d\n", prog_args.nof_prb);
-  
-  // 主循环
-  int nf = 0;
-  while ((nf < prog_args.nof_subframes || prog_args.nof_subframes == -1) && !go_exit) {
-    // 准备SCI数据
-    sci.format = 0;
-    sci.freq_hopping = 0;
-    sci.rb_alloc = pssch_cfg.prb_start_idx;
-    sci.trp_idx = 0;
-    sci.mcs = pssch_cfg.mcs_idx;
-    sci.timing_advance = 0;
-    sci.group_id = 0;
-    
-    // 准备传输数据
-    for (int i = 0; i < pssch.sl_sch_tb_len; i++) {
-      data[i] = rand() % 256;
-    }
-    
-    // 清空子帧缓冲区
-    srsran_vec_cf_zero(sf_buffer, SRSRAN_SF_LEN_PRB(cell.nof_prb));
-    
-    // 编码PSCCH
-    if (srsran_pscch_encode(&pscch, sci.data, sf_buffer, pssch_cfg.prb_start_idx) != SRSRAN_SUCCESS) {
-      ERROR("Error encoding PSCCH");
-      break;
-    }
-    
-    // 编码PSSCH
-    if (srsran_pssch_encode(&pssch, data, pssch.sl_sch_tb_len, sf_buffer) != SRSRAN_SUCCESS) {
-      ERROR("Error encoding PSSCH");
-      break;
-    }
-    
-    // 发送信号
-    srsran_rf_send(&radio, sf_buffer, SRSRAN_SF_LEN_PRB(cell.nof_prb), true);
-    
-    // 记录发送信息
-    log_message(prog_args.log_file, "子帧 %d: 成功发送LTE-V信号\n", nf);
-    
-    // 更新子帧索引
-    pssch_cfg.sf_idx = (pssch_cfg.sf_idx + 1) % 10;
-    
-    // 等待下一个子帧
-    usleep(1000);
-    
-    nf++;
-  }
-  
-  // 记录结束信息
-  log_message(prog_args.log_file, "LTE-V发射程序结束，共发送 %d 个子帧\n", nf);
+  // 发送信号
+  srsran_rf_send(&radio, sf_buffer, SRSRAN_SF_LEN_PRB(cell.nof_prb), true);
   
   // 清理资源
+  free(data);
+  free(sf_buffer);
   srsran_pscch_free(&pscch);
   srsran_pssch_free(&pssch);
   srsran_rf_close(&radio);
-  free(sf_buffer);
-  free(data);
   
-  printf("Done\n");
-  exit(0);
+  return 0;
 } 

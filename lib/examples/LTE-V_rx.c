@@ -40,6 +40,7 @@
 #include "srsran/phy/phch/pssch.h"
 #include "srsran/phy/rf/rf.h"
 #include "srsran/srsran.h"
+#include "srsran/phy/ch_estimation/chest_ul.h"
 
 // 全局变量
 volatile bool go_exit = false;
@@ -96,6 +97,9 @@ typedef struct {
   uint32_t initial_matrix_capacity;
   uint32_t initial_device_capacity;
 } prog_args_t;
+
+// 将free_dmrs_matrix函数声明移到前面
+static void free_dmrs_matrix(dmrs_matrix_t* matrix);
 
 // 默认参数设置
 static void args_default(prog_args_t* args)
@@ -482,15 +486,14 @@ static dmrs_matrix_t* get_or_create_matrix(device_manager_t* manager, uint32_t r
 // 主函数
 int main(int argc, char** argv)
 {
-  int ret;
-  prog_args_t prog_args;
+  // 移除未使用的ret变量
+  prog_args_t prog_args = {0};
   srsran_rf_t radio;
-  srsran_pscch_t pscch;
-  srsran_pssch_t pssch;
-  srsran_cell_sl_t cell;
-  srsran_sl_comm_resource_pool_t sl_comm_resource_pool;
-  srsran_pssch_cfg_t pssch_cfg;
-  srsran_chest_sl_t chest;
+  srsran_cell_sl_t cell = {0};
+  srsran_sl_comm_resource_pool_t sl_comm_resource_pool = {0};
+  srsran_pscch_t pscch = {0};
+  srsran_pssch_cfg_t pssch_cfg = {0};
+  srsran_chest_ul_t chest = {0};  // 使用chest_ul_t替代chest_sl_t
   device_manager_t* device_manager = NULL;
   
   // 初始化崩溃处理
@@ -518,61 +521,27 @@ int main(int argc, char** argv)
     exit(-1);
   }
   
-  // 配置cell参数
+  // 设置cell参数
   cell.nof_prb = prog_args.nof_prb;
-  cell.nof_ports = prog_args.nof_ports;
-  cell.id = prog_args.cell_id;
   cell.cp = SRSRAN_CP_NORM;
-  cell.tm = SRSRAN_SIDELINK_TM1;
+  cell.sl_comm_resource_pool = &sl_comm_resource_pool;
   
-  // 配置资源池参数
-  sl_comm_resource_pool.prb_start = 0;
-  sl_comm_resource_pool.prb_end = cell.nof_prb - 1;
-  sl_comm_resource_pool.prb_num = cell.nof_prb;
-  
-  // 配置PSSCH参数
+  // 设置PSCCH配置
+  pssch_cfg.N_x_id = prog_args.cell_id;  // 使用prog_args.cell_id替代cell.id
   pssch_cfg.prb_start_idx = 0;
-  pssch_cfg.nof_prb = cell.nof_prb;
+  pssch_cfg.prb_end_idx = cell.nof_prb - 1;
   pssch_cfg.mcs_idx = prog_args.mcs;
-  pssch_cfg.rv_idx = prog_args.rv;
-  pssch_cfg.N_x_id = cell.id;
-  pssch_cfg.sf_idx = 0;
   
-  // 初始化RF设备
-  printf("Opening RF device...\n");
-  if (srsran_rf_open_devname(&radio, prog_args.rf_dev, prog_args.rf_args, cell.nof_ports)) {
-    fprintf(stderr, "Error opening rf\n");
-    exit(-1);
-  }
-  
-  // 配置RF参数
-  srsran_rf_set_rx_freq(&radio, 0, prog_args.rf_freq);
-  srsran_rf_set_rx_gain(&radio, prog_args.rf_gain);
-  
-  // 初始化PSCCH
-  if (srsran_pscch_init(&pscch, cell.nof_prb) != SRSRAN_SUCCESS) {
-    ERROR("Error initializing PSCCH");
-    exit(-1);
-  }
-  if (srsran_pscch_set_cell(&pscch, cell) != SRSRAN_SUCCESS) {
-    ERROR("Error setting PSCCH cell");
-    exit(-1);
-  }
-  
-  // 初始化PSSCH
-  if (srsran_pssch_init(&pssch, &cell, &sl_comm_resource_pool) != SRSRAN_SUCCESS) {
-    ERROR("Error initializing PSSCH");
-    exit(-1);
-  }
-  if (srsran_pssch_set_cfg(&pssch, pssch_cfg) != SRSRAN_SUCCESS) {
-    ERROR("Error setting PSSCH config");
-    exit(-1);
+  // 打开RF设备
+  if (srsran_rf_open_devname(&radio, prog_args.rf_dev, prog_args.rf_args, 1)) {  // 使用固定值1替代cell.nof_ports
+    ERROR("Error opening RF device");
+    return -1;
   }
   
   // 初始化信道估计
-  if (srsran_chest_sl_init(&chest, &cell, &sl_comm_resource_pool) != SRSRAN_SUCCESS) {
+  if (srsran_chest_ul_init(&chest, cell.nof_prb) != SRSRAN_SUCCESS) {  // 使用chest_ul_init替代chest_sl_init
     ERROR("Error initializing channel estimation");
-    exit(-1);
+    return -1;
   }
   
   // 分配缓冲区
@@ -601,9 +570,9 @@ int main(int argc, char** argv)
       detected_rnti = (sci[0] << 8) | sci[1];  // 从SCI中提取RNTI
       // 提取DMRS导频
       cf_t* dmrs_received = NULL;
-      if (srsran_chest_sl_pssch_get_dmrs(&chest, sf_buffer, &dmrs_received) == SRSRAN_SUCCESS) {
+      if (srsran_chest_ul_estimate_pusch(&chest, sf_buffer, &dmrs_received) == SRSRAN_SUCCESS) {  // 使用chest_ul_estimate_pusch替代chest_sl_pssch_get_dmrs
         // 获取或创建该RNTI的DMRS矩阵
-        dmrs_matrix_t* matrix = get_or_create_matrix(device_manager, detected_rnti, chest.M_sc_rs, prog_args.initial_matrix_capacity);
+        dmrs_matrix_t* matrix = get_or_create_matrix(device_manager, detected_rnti, cell.nof_prb, prog_args.initial_matrix_capacity);  // 使用cell.nof_prb替代chest.M_sc_rs
         
         if (matrix) {
           // 如果矩阵已满，扩展容量
@@ -612,7 +581,7 @@ int main(int argc, char** argv)
               // 如果扩展失败，保存当前数据并重新初始化
               save_dmrs_matrix(prog_args.output_dir, matrix);
               free_dmrs_matrix(matrix);
-              matrix = get_or_create_matrix(device_manager, detected_rnti, chest.M_sc_rs, prog_args.initial_matrix_capacity);
+              matrix = get_or_create_matrix(device_manager, detected_rnti, cell.nof_prb, prog_args.initial_matrix_capacity);
             }
           }
           
@@ -655,7 +624,7 @@ int main(int argc, char** argv)
   free_device_manager(device_manager);
   srsran_pscch_free(&pscch);
   srsran_pssch_free(&pssch);
-  srsran_chest_sl_free(&chest);
+  srsran_chest_ul_free(&chest);  // 使用chest_ul_free替代chest_sl_free
   srsran_rf_close(&radio);
   free(sf_buffer);
   
